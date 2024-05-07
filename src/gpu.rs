@@ -42,7 +42,7 @@ pub struct GPU {
     palb: [u8; 4],
     pal0: [u8; 4],
     pal1: [u8; 4],
-    vram: [u8; VRAM_SIZE],
+    vram: [u8; VRAM_SIZE], // 这里有两个vrambank，一个vram长度0x2000，这里两个长度是0x4000
     voam: [u8; VOAM_SIZE],
     cbgpal_inc: bool,
     cbgpal_ind: u8,
@@ -378,6 +378,12 @@ impl GPU {
         let g = g as u32;
         let b = b as u32;
 
+        // Ref: <http://accu.cc/content/gameboy/video/gpu/#vram-background-maps>
+        // 与现在常用的 8 位 RGB 色彩模式不同, Game Boy 只使用 4 位表示一种颜色通道, 
+        // 每种色彩通道的范围使 0x00 到 0x1f. 在 PC 上显示图像颜色时, 需要进行一次对比
+        // 拉伸, 即拉伸到 0x00 到 0xff 范围. 但是要注意这种转换并不是线性的, 目前尝试下
+        // 来比较合理的拉伸算法如下所示:
+
         self.data[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
         self.data[baseidx + 1] = ((g * 3 + b) << 1) as u8;
         self.data[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
@@ -399,7 +405,7 @@ impl GPU {
             return;
         }
 
-        let wintiley = (winy as u16 >> 3) & 31;
+        let wintiley = (winy as u16 >> 3) & 31; // >>3等同于除以8，因为tile是8*8的大小，所以得除以8确定位置，&31是将u8的高3+8位置零，感觉不加也没事
 
         let bgy = self.scy.wrapping_add(self.line);
         let bgtiley = (bgy as u16 >> 3) & 31;
@@ -412,7 +418,7 @@ impl GPU {
                 (self.win_tilemap,
                 wintiley,
                 (winx as u16 >> 3),
-                winy as u16 & 0x07,
+                winy as u16 & 0x07, // &0x07等价于跟8取余数，确定是在tile的哪一行，下面出现的&0x07意义相同
                 winx as u8 & 0x07)
             } else if drawbg {
                 (self.bg_tilemap,
@@ -446,7 +452,7 @@ impl GPU {
 
             let a0 = match yflip {
                 false => tileaddress + (pixely * 2),
-                true => tileaddress + (14 - (pixely * 2)),
+                true => tileaddress + (14 - (pixely * 2)), // 这里用14-做翻滚是因为，tile最后一行的index是14、15
             };
 
             let (b1, b2) = match vram1 {
@@ -483,7 +489,7 @@ impl GPU {
         let line = self.line as i32;
         let sprite_size = self.sprite_size as i32;
 
-        let mut sprites_to_draw = [(0, 0, 0); 10];
+        let mut sprites_to_draw = [(0, 0, 0); 10]; // GB硬件限制，一行只允许显示10个精灵
         let mut sidx = 0;
         for index in 0 .. 40 {
             let spriteaddr = 0xFE00 + (index as u16) * 4;
