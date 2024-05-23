@@ -7,7 +7,7 @@ pub use crate::sound::AudioPlayer;
 
 pub mod device;
 
-mod cpu;
+pub mod cpu;
 mod gbmode;
 mod gpu;
 mod keypad;

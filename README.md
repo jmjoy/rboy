@@ -1,5 +1,7 @@
 # RBoy
 
+**My fork and HACK: Experimentally parallelizing CPU and PPU.**
+
 A Gameboy Color Emulator written in Rust
 
 

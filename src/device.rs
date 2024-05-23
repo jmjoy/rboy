@@ -5,6 +5,7 @@ use crate::printer::GbPrinter;
 use crate::mbc;
 use crate::sound;
 use crate::StrResult;
+use std::sync::mpsc::SyncSender;
 
 pub struct Device {
     cpu: CPU<'static>,
@@ -20,25 +21,25 @@ fn stdoutprinter(v: u8) -> Option<u8> {
 }
 
 impl Device {
-    pub fn new(romname: &str, skip_checksum: bool) -> StrResult<Device> {
+    pub fn new(romname: &str, skip_checksum: bool, sender: SyncSender<Vec<u8>>) -> StrResult<Device> {
         let cart = mbc::FileBackedMBC::new(romname.into(), skip_checksum)?;
-        CPU::new(Box::new(cart), None).map(|cpu| Device { cpu: cpu })
+        CPU::new(Box::new(cart), None, sender).map(|cpu| Device { cpu: cpu })
     }
 
-    pub fn new_cgb(romname: &str, skip_checksum: bool) -> StrResult<Device> {
+    pub fn new_cgb(romname: &str, skip_checksum: bool, sender: SyncSender<Vec<u8>>) -> StrResult<Device> {
         let cart = mbc::FileBackedMBC::new(romname.into(), skip_checksum)?;
-        CPU::new_cgb(Box::new(cart), None).map(|cpu| Device { cpu: cpu })
+        CPU::new_cgb(Box::new(cart), None, sender).map(|cpu| Device { cpu: cpu })
     }
 
-    pub fn new_from_buffer(romdata: Vec<u8>, skip_checksum: bool) -> StrResult<Device> {
-        let cart = mbc::get_mbc(romdata, skip_checksum)?;
-        CPU::new(cart, None).map(|cpu| Device { cpu: cpu })
-    }
+    // pub fn new_from_buffer(romdata: Vec<u8>, skip_checksum: bool) -> StrResult<Device> {
+    //     let cart = mbc::get_mbc(romdata, skip_checksum)?;
+    //     CPU::new(cart, None).map(|cpu| Device { cpu: cpu })
+    // }
 
-    pub fn new_cgb_from_buffer(romdata: Vec<u8>, skip_checksum: bool) -> StrResult<Device> {
-        let cart = mbc::get_mbc(romdata, skip_checksum)?;
-        CPU::new_cgb(cart, None).map(|cpu| Device { cpu: cpu })
-    }
+    // pub fn new_cgb_from_buffer(romdata: Vec<u8>, skip_checksum: bool) -> StrResult<Device> {
+    //     let cart = mbc::get_mbc(romdata, skip_checksum)?;
+    //     CPU::new_cgb(cart, None).map(|cpu| Device { cpu: cpu })
+    // }
 
     pub fn do_cycle(&mut self) -> u32 {
         self.cpu.do_cycle()
@@ -63,15 +64,13 @@ impl Device {
         self.cpu.mmu.serial.set_callback(Box::new(printfun));
     }
 
-    pub fn check_and_reset_gpu_updated(&mut self) -> bool {
-        let result = self.cpu.mmu.gpu.updated;
-        self.cpu.mmu.gpu.updated = false;
-        result
-    }
+    // pub fn check_and_reset_gpu_updated(&mut self) -> bool {
+    //     self.cpu.mmu.gpu.swap_updated()
+    // }
 
-    pub fn get_gpu_data(&self) -> &[u8] {
-        &self.cpu.mmu.gpu.data
-    }
+    // pub fn get_gpu_data(&self) -> Vec<u8> {
+    //     self.cpu.mmu.gpu.data()
+    // }
 
     pub fn enable_audio(&mut self, player: Box<dyn sound::AudioPlayer>) {
         match self.cpu.mmu.gbmode {

@@ -6,6 +6,7 @@ use crate::sound::Sound;
 use crate::gbmode::{GbMode, GbSpeed};
 use crate::StrResult;
 use crate::mbc;
+use std::sync::mpsc::SyncSender;
 
 const WRAM_SIZE: usize = 0x8000;
 const ZRAM_SIZE: usize = 0x7F;
@@ -54,7 +55,7 @@ fn fill_random(slice: &mut [u8], start: u32) {
 }
 
 impl<'a> MMU<'a> {
-    pub fn new(cart: Box<dyn mbc::MBC+'static>, serial_callback: Option<SerialCallback<'a>>) -> StrResult<MMU<'a>> {
+    pub fn new(cart: Box<dyn mbc::MBC+'static>, serial_callback: Option<SerialCallback<'a>>, sender: SyncSender<Vec<u8>>) -> StrResult<MMU<'a>> {
         let serial = match serial_callback {
             Some(cb) => Serial::new_with_callback(cb),
             None => Serial::new(),
@@ -69,7 +70,7 @@ impl<'a> MMU<'a> {
             serial: serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
-            gpu: GPU::new(),
+            gpu: GPU::new(sender),
             sound: None,
             mbc: cart,
             gbmode: GbMode::Classic,
@@ -89,7 +90,7 @@ impl<'a> MMU<'a> {
         Ok(res)
     }
 
-    pub fn new_cgb(cart: Box<dyn mbc::MBC+'static>, serial_callback: Option<SerialCallback<'a>>) -> StrResult<MMU<'a>> {
+    pub fn new_cgb(cart: Box<dyn mbc::MBC+'static>, serial_callback: Option<SerialCallback<'a>>, sender: SyncSender<Vec<u8>>) -> StrResult<MMU<'a>> {
         let serial = match serial_callback {
             Some(cb) => Serial::new_with_callback(cb),
             None => Serial::new(),
@@ -104,7 +105,7 @@ impl<'a> MMU<'a> {
             serial: serial,
             timer: Timer::new(),
             keypad: Keypad::new(),
-            gpu: GPU::new_cgb(),
+            gpu: GPU::new_cgb(sender),
             sound: None,
             mbc: cart,
             gbmode: GbMode::Color,

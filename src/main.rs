@@ -8,6 +8,7 @@ use std::thread;
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
 use cpal::{Sample, FromSample};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+use rboy::cpu::BARRIER;
 
 const EXITCODE_SUCCESS : i32 = 0;
 const EXITCODE_CPULOADFAILS : i32 = 2;
@@ -127,11 +128,14 @@ fn real_main() -> i32 {
     let filename = matches.get_one::<String>("filename").unwrap();
     let scale = matches.get_one::<u32>("scale").copied().unwrap_or(2);
 
+    let (sender1, receiver1) = mpsc::channel();
+    let (sender2, receiver2) = mpsc::sync_channel(1);
+
     if test_mode {
-        return run_test_mode(filename, opt_classic, opt_skip_checksum);
+        return run_test_mode(filename, opt_classic, opt_skip_checksum, sender2);
     }
 
-    let cpu = construct_cpu(filename, opt_classic, opt_serial, opt_printer, opt_skip_checksum);
+    let cpu = construct_cpu(filename, opt_classic, opt_serial, opt_printer, opt_skip_checksum, sender2);
     if cpu.is_none() { return EXITCODE_CPULOADFAILS; }
     let mut cpu = cpu.unwrap();
 
@@ -151,9 +155,6 @@ fn real_main() -> i32 {
     }
     let romname = cpu.romname();
 
-    let (sender1, receiver1) = mpsc::channel();
-    let (sender2, receiver2) = mpsc::sync_channel(1);
-
     let mut event_loop = winit::event_loop::EventLoop::new().unwrap();
     let window_builder = create_window_builder(&romname);
     let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new().set_window_builder(window_builder).build(&event_loop);
@@ -169,7 +170,7 @@ fn real_main() -> i32 {
 
     let mut renderoptions = <RenderOptions as Default>::default();
 
-    let cputhread = thread::spawn(move|| run_cpu(cpu, sender2, receiver1));
+    let cputhread = thread::spawn(move|| run_cpu(cpu, receiver1));
 
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     'evloop: loop {
@@ -292,10 +293,10 @@ fn warn(message: &str) {
     eprintln!("{}", message);
 }
 
-fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output_printer: bool, skip_checksum: bool) -> Option<Box<Device>> {
+fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output_printer: bool, skip_checksum: bool, sender: SyncSender<Vec<u8>>) -> Option<Box<Device>> {
     let opt_c = match classic_mode {
-        true => Device::new(filename, skip_checksum),
-        false => Device::new_cgb(filename, skip_checksum),
+        true => Device::new(filename, skip_checksum, sender),
+        false => Device::new_cgb(filename, skip_checksum, sender),
     };
     let mut c = match opt_c
     {
@@ -313,22 +314,23 @@ fn construct_cpu(filename: &str, classic_mode: bool, output_serial: bool, output
     Some(Box::new(c))
 }
 
-fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver<GBEvent>) {
+fn run_cpu(mut cpu: Box<Device>, receiver: Receiver<GBEvent>) {
     let periodic = timer_periodic(16);
     let mut limit_speed = true;
 
-    let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32;
+    // let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32; // 671,088.64
+    let waitticks = 702224;
     let mut ticks = 0;
 
     'outer: loop {
         while ticks < waitticks {
             ticks += cpu.do_cycle();
-            if cpu.check_and_reset_gpu_updated() {
-                let data = cpu.get_gpu_data().to_vec();
-                if let Err(TrySendError::Disconnected(..)) = sender.try_send(data) {
-                    break 'outer;
-                }
-            }
+            // if cpu.check_and_reset_gpu_updated() {
+            //     let data = cpu.get_gpu_data().to_vec();
+            //     if let Err(TrySendError::Disconnected(..)) = sender.try_send(data) {
+            //         break 'outer;
+            //     }
+            // }
         }
 
         ticks -= waitticks;
@@ -349,6 +351,8 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
         }
 
         if limit_speed { let _ = periodic.recv(); }
+
+        // BARRIER.wait();
     }
 }
 
@@ -495,10 +499,10 @@ impl rboy::AudioPlayer for NullAudioPlayer {
     }
 }
 
-fn run_test_mode(filename: &str, classic_mode: bool, skip_checksum: bool) -> i32 {
+fn run_test_mode(filename: &str, classic_mode: bool, skip_checksum: bool, sender: SyncSender<Vec<u8>>) -> i32 {
     let opt_cpu = match classic_mode {
-        true => Device::new(filename, skip_checksum),
-        false => Device::new_cgb(filename, skip_checksum),
+        true => Device::new(filename, skip_checksum, sender),
+        false => Device::new_cgb(filename, skip_checksum, sender),
     };
     let mut cpu = match opt_cpu {
         Err(errmsg) => { warn(errmsg); return EXITCODE_CPULOADFAILS; },
@@ -516,7 +520,8 @@ fn run_test_mode(filename: &str, classic_mode: bool, skip_checksum: bool) -> i32
                 match stdin_byte {
                     b'q' => break,
                     b's' => {
-                        let data = cpu.get_gpu_data().to_vec();
+                        // let data = cpu.get_gpu_data().to_vec();
+                        let data = vec![];
                         print_screenshot(data);
                     },
                     v => {

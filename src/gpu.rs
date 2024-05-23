@@ -1,5 +1,5 @@
-use std::cmp::Ordering;
-use crate::gbmode::GbMode;
+use std::{cmp::Ordering, io::{self, Write}, mem::replace, sync::{atomic::{self, AtomicBool}, mpsc::{self, SyncSender}, Arc, Mutex}, thread};
+use crate::{cpu::BARRIER, gbmode::GbMode};
 
 const VRAM_SIZE: usize = 0x4000;
 const VOAM_SIZE: usize = 0xA0;
@@ -51,16 +51,16 @@ pub struct GPU {
     csprit_ind: u8,
     csprit: [[[u8; 3]; 4]; 8],
     vrambank: usize,
-    pub data: Vec<u8>,
-    bgprio: [PrioType; SCREEN_W],
-    pub updated: bool,
     pub interrupt: u8,
     pub gbmode: GbMode,
     hblanking: bool,
+    sender: mpsc::SyncSender<GPULineData>,
+    sender2: SyncSender<Vec<u8>>,
 }
 
 impl GPU {
-    pub fn new() -> GPU {
+    pub fn new(sender2: SyncSender<Vec<u8>>) -> GPU {
+        let sender = GPURender::init(sender2.clone());
         GPU {
             mode: 0,
             modeclock: 0,
@@ -92,9 +92,6 @@ impl GPU {
             pal1: [0; 4],
             vram: [0; VRAM_SIZE],
             voam: [0; VOAM_SIZE],
-            data: vec![0; SCREEN_W * SCREEN_H * 3],
-            bgprio: [PrioType::Normal; SCREEN_W],
-            updated: false,
             interrupt: 0,
             gbmode: GbMode::Classic,
             cbgpal_inc: false,
@@ -105,11 +102,13 @@ impl GPU {
             csprit: [[[0u8; 3]; 4]; 8],
             vrambank: 0,
             hblanking: false,
+            sender,
+            sender2,
         }
     }
 
-    pub fn new_cgb() -> GPU {
-        GPU::new()
+    pub fn new_cgb(sender: SyncSender<Vec<u8>>) -> GPU {
+        GPU::new(sender)
     }
 
     pub fn do_cycle(&mut self, ticks: u32) {
@@ -130,8 +129,11 @@ impl GPU {
                 self.check_interrupt_lyc();
 
                 // This is a VBlank line
-                if self.line >= 144 && self.mode != 1 {
+                if self.line == 144 && self.mode != 1 {
                     self.change_mode(1);
+                }
+                if self.line == 153 {
+                    self.sender.send(GPULineData { line: self.line, ren_data: None }).unwrap();
                 }
             }
 
@@ -166,7 +168,7 @@ impl GPU {
             1 => { // Vertical blank
                 self.wy_trigger = false;
                 self.interrupt |= 0x01;
-                self.updated = true;
+                self.sender.send(GPULineData { line: self.line, ren_data: None }).unwrap();
                 self.m1_inte
             },
             2 => self.m2_inte,
@@ -330,10 +332,7 @@ impl GPU {
     }
 
     fn clear_screen(&mut self) {
-        for v in self.data.iter_mut() {
-            *v = 255;
-        }
-        self.updated = true;
+        self.sender2.send(vec![255; SCREEN_W * SCREEN_H * 3]).unwrap();
     }
 
     fn update_pal(&mut self) {
@@ -354,36 +353,30 @@ impl GPU {
     }
 
     fn renderscan(&mut self) {
-        for x in 0 .. SCREEN_W {
-            self.setcolor(x, 255);
-            self.bgprio[x] = PrioType::Normal;
-        }
-        self.draw_bg();
-        self.draw_sprites();
+        let bg = self.draw_bg();
+        let sprite = self.draw_sprites();
+
+        self.sender.send(GPULineData { line: self.line, ren_data: Some(GPULineRenData {
+            gbmode: self.gbmode,
+            scy: self.scy,
+            winx: self.winx,
+            scx: self.scx,
+            win_tilemap: self.win_tilemap,
+            bg_tilemap: self.bg_tilemap,
+            vram: self.vram.to_vec(),
+            tilebase: self.tilebase,
+            cbgpal: self.cbgpal,
+            palb: self.palb,
+            bg,
+            sprite,
+            lcdc0: self.lcdc0,
+            csprit: self.csprit.to_vec(),
+            pal0: self.pal0.to_vec(),
+            pal1: self.pal1.to_vec(),
+        })  }).unwrap();
     }
 
-    fn setcolor(&mut self, x: usize, color: u8) {
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 0] = color;
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 1] = color;
-        self.data[self.line as usize * SCREEN_W * 3 + x * 3 + 2] = color;
-    }
-
-    fn setrgb(&mut self, x: usize, r: u8, g: u8, b: u8) {
-        // Gameboy Color RGB correction
-        // Taken from the Gambatte emulator
-        // assume r, g and b are between 0 and 1F
-        let baseidx = self.line as usize * SCREEN_W * 3 + x * 3;
-
-        let r = r as u32;
-        let g = g as u32;
-        let b = b as u32;
-
-        self.data[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
-        self.data[baseidx + 1] = ((g * 3 + b) << 1) as u8;
-        self.data[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
-    }
-
-    fn draw_bg(&mut self) {
+    fn draw_bg(&mut self) -> Option<GPULineBgData> {
         let drawbg = self.gbmode == GbMode::Color || self.lcdc0;
 
         let wx_trigger = self.winx <= 166;
@@ -396,162 +389,19 @@ impl GPU {
         };
 
         if winy < 0 && drawbg == false {
-            return;
+            self.sender.send(GPULineData { line: self.line, ren_data: None  }).unwrap();
+            return None;
         }
 
-        let wintiley = (winy as u16 >> 3) & 31;
-
-        let bgy = self.scy.wrapping_add(self.line);
-        let bgtiley = (bgy as u16 >> 3) & 31;
-
-        for x in 0 .. SCREEN_W {
-            let winx = - ((self.winx as i32) - 7) + (x as i32);
-            let bgx = self.scx as u32 + x as u32;
-
-            let (tilemapbase, tiley, tilex, pixely, pixelx) = if winy >= 0 && winx >= 0 {
-                (self.win_tilemap,
-                wintiley,
-                (winx as u16 >> 3),
-                winy as u16 & 0x07,
-                winx as u8 & 0x07)
-            } else if drawbg {
-                (self.bg_tilemap,
-                bgtiley,
-                (bgx as u16 >> 3) & 31,
-                bgy as u16 & 0x07,
-                bgx as u8 & 0x07)
-            } else {
-                continue;
-            };
-
-            let tilenr: u8 = self.rbvram0(tilemapbase + tiley * 32 + tilex);
-
-            let (palnr, vram1, xflip, yflip, prio) = if self.gbmode == GbMode::Color {
-                let flags = self.rbvram1(tilemapbase + tiley * 32 + tilex) as usize;
-                (flags & 0x07,
-                flags & (1 << 3) != 0,
-                flags & (1 << 5) != 0,
-                flags & (1 << 6) != 0,
-                flags & (1 << 7) != 0)
-            } else {
-                (0, false, false, false, false)
-            };
-
-            let tileaddress = self.tilebase
-            + (if self.tilebase == 0x8000 {
-                tilenr as u16
-            } else {
-                (tilenr as i8 as i16 + 128) as u16
-            }) * 16;
-
-            let a0 = match yflip {
-                false => tileaddress + (pixely * 2),
-                true => tileaddress + (14 - (pixely * 2)),
-            };
-
-            let (b1, b2) = match vram1 {
-                false => (self.rbvram0(a0), self.rbvram0(a0 + 1)),
-                true => (self.rbvram1(a0), self.rbvram1(a0 + 1)),
-            };
-
-            let xbit = match xflip {
-                true => pixelx,
-                false => 7 - pixelx,
-            } as u32;
-            let colnr = if b1 & (1 << xbit) != 0 { 1 } else { 0 }
-                | if b2 & (1 << xbit) != 0 { 2 } else { 0 };
-
-            self.bgprio[x] =
-                if colnr == 0 { PrioType::Color0 }
-                else if prio { PrioType::PrioFlag }
-                else { PrioType::Normal };
-            if self.gbmode == GbMode::Color {
-                let r = self.cbgpal[palnr][colnr][0];
-                let g = self.cbgpal[palnr][colnr][1];
-                let b = self.cbgpal[palnr][colnr][2];
-                self.setrgb(x as usize, r, g, b);
-            } else {
-                let color = self.palb[colnr];
-                self.setcolor(x, color);
-            }
-        }
+        Some(GPULineBgData { drawbg, winy })
     }
 
-    fn draw_sprites(&mut self) {
-        if !self.sprite_on { return }
-
-        let line = self.line as i32;
-        let sprite_size = self.sprite_size as i32;
-
-        let mut sprites_to_draw = [(0, 0, 0); 10];
-        let mut sidx = 0;
-        for index in 0 .. 40 {
-            let spriteaddr = 0xFE00 + (index as u16) * 4;
-            let spritey = self.rb(spriteaddr + 0) as u16 as i32 - 16;
-            if line < spritey || line >= spritey + sprite_size { continue }
-            let spritex = self.rb(spriteaddr + 1) as u16 as i32 - 8;
-            sprites_to_draw[sidx] = (spritex, spritey, index);
-            sidx += 1;
-            if sidx >= 10 {
-                break;
-            }
-        }
-        if self.gbmode == GbMode::Color {
-            sprites_to_draw[..sidx].sort_unstable_by(cgb_sprite_order);
-        }
-        else {
-            sprites_to_draw[..sidx].sort_unstable_by(dmg_sprite_order);
-        }
-
-        for &(spritex, spritey, i) in &sprites_to_draw[..sidx] {
-            if spritex < -7 || spritex >= (SCREEN_W as i32) { continue }
-
-            let spriteaddr = 0xFE00 + (i as u16) * 4;
-            let tilenum = (self.rb(spriteaddr + 2) & (if self.sprite_size == 16 { 0xFE } else { 0xFF })) as u16;
-            let flags = self.rb(spriteaddr + 3) as usize;
-            let usepal1: bool = flags & (1 << 4) != 0;
-            let xflip: bool = flags & (1 << 5) != 0;
-            let yflip: bool = flags & (1 << 6) != 0;
-            let belowbg: bool = flags & (1 << 7) != 0;
-            let c_palnr = flags & 0x07;
-            let c_vram1: bool = flags & (1 << 3) != 0;
-
-            let tiley: u16 = if yflip {
-                (sprite_size - 1 - (line - spritey)) as u16
-            } else {
-                (line - spritey) as u16
-            };
-
-            let tileaddress = 0x8000u16 + tilenum * 16 + tiley * 2;
-            let (b1, b2) = if c_vram1 && self.gbmode == GbMode::Color {
-                (self.rbvram1(tileaddress), self.rbvram1(tileaddress + 1))
-            } else {
-                (self.rbvram0(tileaddress), self.rbvram0(tileaddress + 1))
-            };
-
-            'xloop: for x in 0 .. 8 {
-                if spritex + x < 0 || spritex + x >= (SCREEN_W as i32) { continue }
-
-                let xbit = 1 << (if xflip { x } else { 7 - x } as u32);
-                let colnr = (if b1 & xbit != 0 { 1 } else { 0 }) |
-                    (if b2 & xbit != 0 { 2 } else { 0 });
-                if colnr == 0 { continue }
-
-                if self.gbmode == GbMode::Color {
-                    if self.lcdc0 && (self.bgprio[(spritex + x) as usize] == PrioType::PrioFlag || (belowbg && self.bgprio[(spritex + x) as usize] != PrioType::Color0)) {
-                        continue 'xloop
-                    }
-                    let r = self.csprit[c_palnr][colnr][0];
-                    let g = self.csprit[c_palnr][colnr][1];
-                    let b = self.csprit[c_palnr][colnr][2];
-                    self.setrgb((spritex + x) as usize, r, g, b);
-                } else {
-                    if belowbg && self.bgprio[(spritex + x) as usize] != PrioType::Color0 { continue 'xloop }
-                    let color = if usepal1 { self.pal1[colnr] } else { self.pal0[colnr] };
-                    self.setcolor((spritex + x) as usize, color);
-                }
-            }
-        }
+    fn draw_sprites(&mut self) -> Option<GPULineSpriteData> {
+        if !self.sprite_on { return None; }
+        Some(GPULineSpriteData {
+            sprite_size: self.sprite_size,
+            voam: self.voam.to_vec(),
+        })
     }
 
     pub fn may_hdma(&self) -> bool {
@@ -572,4 +422,288 @@ fn dmg_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
 fn cgb_sprite_order(a: &(i32, i32, u8), b: &(i32, i32, u8)) -> Ordering {
     // CGB order: only prioritize based on OAM position.
     return b.2.cmp(&a.2);
+}
+
+struct GPULineData {
+    line: u8,
+    ren_data: Option<GPULineRenData>,
+}
+
+struct GPULineRenData {
+    pub gbmode: GbMode,
+    lcdc0: bool,
+    scy: u8,
+    winx: u8,
+    scx: u8,
+    win_tilemap: u16,
+    bg_tilemap: u16,
+    vram: Vec<u8>,
+    tilebase: u16,
+    cbgpal: [[[u8; 3]; 4]; 8],
+    palb: [u8; 4],
+    bg: Option<GPULineBgData>,
+    sprite: Option<GPULineSpriteData>,
+    csprit: Vec<[[u8; 3]; 4]>,
+    pal0: Vec<u8>,
+    pal1: Vec<u8>,
+}
+
+struct GPULineBgData {
+    drawbg: bool,
+    winy: i32,
+}
+
+struct GPULineSpriteData {
+    sprite_size: u32,
+    voam: Vec<u8>,
+}
+
+struct GPURender {
+    pub data: Vec<u8>,
+    bgprio: [PrioType; SCREEN_W],
+    sender2: SyncSender<Vec<u8>>,
+}
+
+impl GPURender {
+    fn init(sender2: SyncSender<Vec<u8>>) -> mpsc::SyncSender<GPULineData> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        let mut render = Self {
+            data: vec![0; SCREEN_W * SCREEN_H * 3],
+            bgprio: [PrioType::Normal; SCREEN_W],
+            sender2,
+        };
+
+        thread::spawn(move || {
+            loop {
+                let line_data = receiver.recv().unwrap();
+                render.renderscan(line_data);
+            }
+        });
+
+        sender
+    }
+
+    fn renderscan(&mut self, line_data: GPULineData) {
+        // print!("{}.", line_data.line);
+        // io::stdout().flush().unwrap();
+        if line_data.line == 153 {
+            // BARRIER.wait();
+            return;
+        }
+
+        if line_data.line > 144 {
+            return;
+        }
+
+        if line_data.line == 144 {
+            let data = replace(&mut self.data, vec![0; SCREEN_W * SCREEN_H * 3]);
+            self.sender2.send(data).unwrap();
+            return;
+        }
+
+        for x in 0 .. SCREEN_W {
+            self.setcolor(x, 255, line_data.line);
+            self.bgprio[x] = PrioType::Normal;
+        }
+        if let Some(ren_data) = &line_data.ren_data {
+            if let Some(bg) = &ren_data.bg {
+                self.draw_bg(ren_data, bg, line_data.line);
+            }
+            if let Some(sprite) = &ren_data.sprite {
+                self.draw_sprites(ren_data, sprite, line_data.line);
+            }
+        }
+    }
+
+    fn setcolor(&mut self, x: usize, color: u8, line: u8) {
+        let data = &mut self.data;
+        data[line as usize * SCREEN_W * 3 + x * 3 + 0] = color;
+        data[line as usize * SCREEN_W * 3 + x * 3 + 1] = color;
+        data[line as usize * SCREEN_W * 3 + x * 3 + 2] = color;
+    }
+
+    fn setrgb(&mut self, x: usize, r: u8, g: u8, b: u8, line: u8) {
+        // Gameboy Color RGB correction
+        // Taken from the Gambatte emulator
+        // assume r, g and b are between 0 and 1F
+        let baseidx = line as usize * SCREEN_W * 3 + x * 3;
+
+        let r = r as u32;
+        let g = g as u32;
+        let b = b as u32;
+
+        let mut data = &mut self.data;
+        data[baseidx + 0] = ((r * 13 + g * 2 + b) >> 1) as u8;
+        data[baseidx + 1] = ((g * 3 + b) << 1) as u8;
+        data[baseidx + 2] = ((r * 3 + g * 2 + b * 11) >> 1) as u8;
+    }
+
+    fn draw_bg(&mut self, d: &GPULineRenData, bg: &GPULineBgData, line: u8) {
+        let wintiley = (bg.winy as u16 >> 3) & 31;
+
+        let bgy = d.scy.wrapping_add(line);
+        let bgtiley = (bgy as u16 >> 3) & 31;
+
+        for x in 0 .. SCREEN_W {
+            let winx = - ((d.winx as i32) - 7) + (x as i32);
+            let bgx = d.scx as u32 + x as u32;
+
+            let (tilemapbase, tiley, tilex, pixely, pixelx) = if bg.winy >= 0 && winx >= 0 {
+                (d.win_tilemap,
+                wintiley,
+                (winx as u16 >> 3),
+                bg.winy as u16 & 0x07,
+                winx as u8 & 0x07)
+            } else if bg.drawbg {
+                (d.bg_tilemap,
+                bgtiley,
+                (bgx as u16 >> 3) & 31,
+                bgy as u16 & 0x07,
+                bgx as u8 & 0x07)
+            } else {
+                continue;
+            };
+
+            let tilenr: u8 = self.rbvram0(tilemapbase + tiley * 32 + tilex, &d.vram);
+
+            let (palnr, vram1, xflip, yflip, prio) = if d.gbmode == GbMode::Color {
+                let flags = self.rbvram1(tilemapbase + tiley * 32 + tilex, &d.vram) as usize;
+                (flags & 0x07,
+                flags & (1 << 3) != 0,
+                flags & (1 << 5) != 0,
+                flags & (1 << 6) != 0,
+                flags & (1 << 7) != 0)
+            } else {
+                (0, false, false, false, false)
+            };
+
+            let tileaddress = d.tilebase
+            + (if d.tilebase == 0x8000 {
+                tilenr as u16
+            } else {
+                (tilenr as i8 as i16 + 128) as u16
+            }) * 16;
+
+            let a0 = match yflip {
+                false => tileaddress + (pixely * 2),
+                true => tileaddress + (14 - (pixely * 2)),
+            };
+
+            let (b1, b2) = match vram1 {
+                false => (self.rbvram0(a0, &d.vram), self.rbvram0(a0 + 1, &d.vram)),
+                true => (self.rbvram1(a0, &d.vram), self.rbvram1(a0 + 1, &d.vram)),
+            };
+
+            let xbit = match xflip {
+                true => pixelx,
+                false => 7 - pixelx,
+            } as u32;
+            let colnr = if b1 & (1 << xbit) != 0 { 1 } else { 0 }
+                | if b2 & (1 << xbit) != 0 { 2 } else { 0 };
+
+            self.bgprio[x] =
+                if colnr == 0 { PrioType::Color0 }
+                else if prio { PrioType::PrioFlag }
+                else { PrioType::Normal };
+            if d.gbmode == GbMode::Color {
+                let r = d.cbgpal[palnr][colnr][0];
+                let g = d.cbgpal[palnr][colnr][1];
+                let b = d.cbgpal[palnr][colnr][2];
+                self.setrgb(x as usize, r, g, b, line);
+            } else {
+                let color = d.palb[colnr];
+                self.setcolor(x, color, line);
+            }
+        }
+    }
+
+    fn draw_sprites(&mut self, d: &GPULineRenData, sprite: &GPULineSpriteData, line_: u8) {
+        let line = line_ as i32;
+        let sprite_size = sprite.sprite_size as i32;
+
+        let mut sprites_to_draw = [(0, 0, 0); 10];
+        let mut sidx = 0;
+        for index in 0 .. 40 {
+            let spriteaddr = 0xFE00 + (index as u16) * 4;
+            let spritey = self.rb_ovam(&sprite.voam, spriteaddr + 0) as u16 as i32 - 16;
+            if line < spritey || line >= spritey + sprite_size { continue }
+            let spritex = self.rb_ovam(&sprite.voam, spriteaddr + 1) as u16 as i32 - 8;
+            sprites_to_draw[sidx] = (spritex, spritey, index);
+            sidx += 1;
+            if sidx >= 10 {
+                break;
+            }
+        }
+        if d.gbmode == GbMode::Color {
+            sprites_to_draw[..sidx].sort_unstable_by(cgb_sprite_order);
+        }
+        else {
+            sprites_to_draw[..sidx].sort_unstable_by(dmg_sprite_order);
+        }
+
+        for &(spritex, spritey, i) in &sprites_to_draw[..sidx] {
+            if spritex < -7 || spritex >= (SCREEN_W as i32) { continue }
+
+            let spriteaddr = 0xFE00 + (i as u16) * 4;
+            let tilenum = (self.rb_ovam(&sprite.voam, spriteaddr + 2) & (if sprite.sprite_size == 16 { 0xFE } else { 0xFF })) as u16;
+            let flags = self.rb_ovam(&sprite.voam, spriteaddr + 3) as usize;
+            let usepal1: bool = flags & (1 << 4) != 0;
+            let xflip: bool = flags & (1 << 5) != 0;
+            let yflip: bool = flags & (1 << 6) != 0;
+            let belowbg: bool = flags & (1 << 7) != 0;
+            let c_palnr = flags & 0x07;
+            let c_vram1: bool = flags & (1 << 3) != 0;
+
+            let tiley: u16 = if yflip {
+                (sprite_size - 1 - (line - spritey)) as u16
+            } else {
+                (line - spritey) as u16
+            };
+
+            let tileaddress = 0x8000u16 + tilenum * 16 + tiley * 2;
+            let (b1, b2) = if c_vram1 && d.gbmode == GbMode::Color {
+                (self.rbvram1(tileaddress, &d.vram), self.rbvram1(tileaddress + 1, &d.vram))
+            } else {
+                (self.rbvram0(tileaddress, &d.vram), self.rbvram0(tileaddress + 1, &d.vram))
+            };
+
+            'xloop: for x in 0 .. 8 {
+                if spritex + x < 0 || spritex + x >= (SCREEN_W as i32) { continue }
+
+                let xbit = 1 << (if xflip { x } else { 7 - x } as u32);
+                let colnr = (if b1 & xbit != 0 { 1 } else { 0 }) |
+                    (if b2 & xbit != 0 { 2 } else { 0 });
+                if colnr == 0 { continue }
+
+                if d.gbmode == GbMode::Color {
+                    if d.lcdc0 && (self.bgprio[(spritex + x) as usize] == PrioType::PrioFlag || (belowbg && self.bgprio[(spritex + x) as usize] != PrioType::Color0)) {
+                        continue 'xloop
+                    }
+                    let r = d.csprit[c_palnr][colnr][0];
+                    let g = d.csprit[c_palnr][colnr][1];
+                    let b = d.csprit[c_palnr][colnr][2];
+                    self.setrgb((spritex + x) as usize, r, g, b, line_);
+                } else {
+                    if belowbg && self.bgprio[(spritex + x) as usize] != PrioType::Color0 { continue 'xloop }
+                    let color = if usepal1 { d.pal1[colnr] } else { d.pal0[colnr] };
+                    self.setcolor((spritex + x) as usize, color, line_);
+                }
+            }
+        }
+    }
+
+    fn rbvram0(&self, a: u16, vram: &[u8]) -> u8 {
+        if a < 0x8000 || a >= 0xA000 { panic!("Shouldn't have used rbvram0"); }
+        vram[a as usize & 0x1FFF]
+    }
+    fn rbvram1(&self, a: u16, vram: &[u8]) -> u8 {
+        if a < 0x8000 || a >= 0xA000 { panic!("Shouldn't have used rbvram1"); }
+        vram[0x2000 + (a as usize & 0x1FFF)]
+    }
+
+    #[inline]
+    pub fn rb_ovam(&self, voam: &[u8], a: u16) -> u8 {
+        voam[a as usize - 0xFE00]
+    }
 }
